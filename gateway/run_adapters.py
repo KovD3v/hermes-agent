@@ -788,6 +788,16 @@ class GatewayAdapterLifecycleMixin:
         self._sync_voice_mode_state_to_adapter(adapter)
         self._bind_voice_input_callback(adapter)
 
+    def _schedule_planned_restart_replay(self) -> None:
+        """Replay the owed planned-restart notice after a reconnect, in the background: notification delivery
+        must not hold up adapter recovery or other platforms' reconnects."""
+        from gateway.run import _planned_restart_notification_pending
+        if _planned_restart_notification_pending():
+            task = self._retain_background_task(asyncio.create_task(
+                self._replay_pending_planned_restart_notification(),
+            ))
+            task.add_done_callback(self._late_failure_callback("planned-restart notification replay failed"))
+
     async def _install_reconnected_adapter(self, platform, adapter) -> None:
         """Publish a freshly reconnected primary adapter and replay what it missed while down."""
         self._publish_primary_adapter(platform, adapter)
@@ -806,13 +816,7 @@ class GatewayAdapterLifecycleMixin:
             logger.info("⚠ %s reconnected in degraded mode (receive path not yet confirmed)", platform.value)
         else:
             logger.info("✓ %s reconnected successfully", platform.value)
-        # Notification delivery must not hold up adapter recovery or other platforms' reconnects.
-        from gateway.run import _planned_restart_notification_pending
-        if _planned_restart_notification_pending():
-            task = self._retain_background_task(asyncio.create_task(
-                self._replay_pending_planned_restart_notification(),
-            ))
-            task.add_done_callback(self._late_failure_callback("planned-restart notification replay failed"))
+        self._schedule_planned_restart_replay()
         # Responses rejected while down are owned by this live process (startup recovery cannot claim them).
         with _log_suppressed(
             logging.DEBUG, "failed-obligation redelivery after %s reconnect failed",
@@ -869,10 +873,13 @@ class GatewayAdapterLifecycleMixin:
                 publish_runtime_status(served_profiles=[])
             return 0
         try:
-            from hermes_cli.profiles import get_active_profile_name
+            from hermes_cli.profiles import get_active_profile_name, profiles_to_serve, profile_is_parked
         except Exception:
             return 0
         active = get_active_profile_name() or "default"  # launch profile, pre-identity (adapter boot)
+        for name, home in profiles_to_serve(True, include_parked=True):
+            if name != "default" and profile_is_parked(home):
+                logger.info("profile '%s' is parked (gateway.parked); not served by this gateway", name)
         connected = 0
         claimed = self._primary_resource_claims(active)
         profile_homes = _multiplex_profile_homes(self.config)
@@ -898,6 +905,13 @@ class GatewayAdapterLifecycleMixin:
         # would park a transiently-failed profile before the first watcher tick can retry it.
         for profile_name in transient_failed:
             self._served_profile_signatures.pop(profile_name, None)
+        # Cached configs follow the served set: a profile that failed to start (or stopped being
+        # served) keeps no home channel in the host-wide notice fan-out, where it would be owed a
+        # notice no transport can deliver and ``.restart_pending.json`` would never be unlinked.
+        configs = getattr(self, "_profile_configs", None)
+        if configs is not None:
+            for profile_name in [p for p in configs if p not in self._served_profile_signatures]:
+                configs.pop(profile_name, None)
         self._restore_secondary_completion_ledgers(profile_homes)
         return connected
 
@@ -931,6 +945,12 @@ class GatewayAdapterLifecycleMixin:
                         self.pairing_store if name == active else PairingStore(profile=name)
                     )
             publish_runtime_status(served_profiles=served)
+            # The host record is what a second `gateway run` reads to decide attach-vs-start; keep
+            # its served set in step with the live one (it is republished, never re-claimed).
+            from gateway.host_rendezvous import ROLE_GATEWAY, owns_host_lock, publish_record
+            if owns_host_lock(ROLE_GATEWAY):
+                from hermes_constants import get_hermes_home
+                publish_record(ROLE_GATEWAY, profiles=tuple(served), home=str(get_hermes_home()))
 
     async def _load_secondary_profile_config(self, profile_name: str, profile_home: "Path"):
         """Hydrate + enter ``profile_home``'s scope once; return its gateway config. Raises
@@ -947,8 +967,9 @@ class GatewayAdapterLifecycleMixin:
         await asyncio.to_thread(hydrate_profile_secret_sources, profile_home)
         with _profile_runtime_scope(profile_home, hydrate_secrets=False):
             profile_runtime_cfg = _load_gateway_config()
-            from hermes_cli.plugins import discover_plugins
+            from hermes_cli.plugins import discover_plugins, get_plugin_manager
             discover_plugins()
+            self._subscribe_plugin_rewire(get_plugin_manager(), profile_name, profile_home)
             # This profile's `hooks:` block: start() registered before any profile scope existed.
             self._register_config_hooks(
                 "shell-hook/webhook registration failed for profile '%s'", profile_name, level=logging.WARNING,
@@ -1041,6 +1062,12 @@ class GatewayAdapterLifecycleMixin:
         """Create+connect one profile's adapters under its runtime scope."""
         from gateway.run import _platform_has_bot_credential, _profile_runtime_scope
         profile_cfg = await self._load_secondary_profile_config(profile_name, profile_home)
+        # Keep the served profile's config: host-wide passes (planned-restart notices) must reach
+        # every served profile's home channels, and this is the only place it is loaded.
+        configs = getattr(self, "_profile_configs", None)
+        if configs is None:
+            configs = self._profile_configs = {}
+        configs[profile_name] = profile_cfg
         multiplex = self._multiplex_on()
         profile_map = self._profile_adapters.setdefault(profile_name, {})
         connected = 0
@@ -1250,6 +1277,14 @@ class GatewayAdapterLifecycleMixin:
                             await self._redeliver_failed_obligations_for_platform(
                                 platform, profile=profile_name
                             )
+                            # What a primary reconnect replays too: the owed notice spans served profiles' home
+                            # channels, and sessions boot skipped for this offline adapter wait for this call.
+                            self._schedule_planned_restart_replay()
+                            try:
+                                self._schedule_resume_pending_sessions(platform=platform)
+                            except Exception:
+                                logger.debug("resume-pending reschedule after %s reconnect failed (profile: %s)",
+                                             platform.value, profile_name, exc_info=True)
                             return
                     # Not installed (newer reconnect won the slot, shutdown began, or connect failed):
                     # release partial resources; stop only for a non-retryable fatal.

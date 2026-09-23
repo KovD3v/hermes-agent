@@ -1,4 +1,6 @@
-import type { ConnectionRequestPayload } from '@hermes/shared'
+import type { ConnectionRequestPayload, ToolLabel } from '@hermes/shared'
+
+export type StoredToolCallLabels = Record<string, ToolLabel[]>
 
 export interface ConfigFieldSchema {
   category?: string
@@ -494,6 +496,8 @@ export interface PaginatedSessions {
   /** Per-profile read failures from the cross-profile aggregator (e.g. a locked
    *  or corrupt state.db). Present only on `/api/profiles/sessions`. */
   errors?: Array<{ profile: string; error: string }>
+  /** `{profile: 'corrupt'}` for each listed profile whose state.db is structurally damaged. */
+  storage?: Record<string, 'corrupt'>
 }
 
 export interface SessionCreateResponse {
@@ -615,6 +619,8 @@ export interface SessionMessage {
    */
   args?: unknown
   codex_reasoning_items?: unknown
+  labels?: ToolLabel[]
+  tool_call_labels?: StoredToolCallLabels
   /** Responses-API assistant message items; text parts here are the
    *  user-visible reply when `content` persisted empty (#68321). */
   codex_message_items?: unknown
@@ -1031,6 +1037,8 @@ export interface ProfileInfo {
   name: string
   path: string
   provider: null | string
+  /** Backend-assigned role from profile.yaml; `setup` marks the onboarding guide's profile. */
+  role?: 'setup' | null
   skill_count: number
 }
 
@@ -1653,6 +1661,7 @@ export interface McpServerTestResponse {
 export interface McpCatalogEntry {
   name: string
   description: string
+  connector_slug?: string | null
   source: string
   transport: string
   auth_type: string
