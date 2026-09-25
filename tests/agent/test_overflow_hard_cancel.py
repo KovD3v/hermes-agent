@@ -13,7 +13,7 @@ def test_cancelled_overflow_does_not_exhaust_compression(hard_cancel):
     messages = [{"role": "user", "content": "history"}]
     agent = SimpleNamespace(
         _interrupt_requested=False, _hard_interrupt_requested=Event(), _persist_session=Mock(), clear_interrupt=Mock(),
-        _vprint=Mock(), log_prefix="",
+        _vprint=Mock(), log_prefix="", _drop_trailing_empty_response_scaffolding=Mock(),
     )
 
     def cancel(*args, **kwargs):
